@@ -87,3 +87,75 @@
 ---
 
 如需我进一步把调用链画成结构图（Mermaid）或补充“参数范围建议”，告诉我你的训练预算与显存限制即可。
+
+## 5. 细化版调用链：从 `PCVRHyFormer.forward` 到 logits
+
+```text
+PCVRHyFormer.forward(inputs)
+  ├─ user_ns = user_ns_tokenizer(inputs.user_int_feats)
+  ├─ item_ns = item_ns_tokenizer(inputs.item_int_feats)
+  ├─ user_dense_token = user_dense_proj(inputs.user_dense_feats)  # optional
+  ├─ item_dense_token = item_dense_proj(inputs.item_dense_feats)  # optional
+  ├─ ns_tokens = concat(user_ns, user_dense_token, item_ns, item_dense_token)
+  ├─ for domain in seq_domains:
+  │    ├─ seq_tokens = _embed_seq_domain(domain, seq_feats, seq_times)
+  │    └─ seq_mask = _make_padding_mask(seq_len, max_len)
+  ├─ q_tokens_list = MultiSeqQueryGenerator(ns_tokens, seq_tokens_list, seq_masks)
+  ├─ for block in hyformer_blocks:
+  │    ├─ seq_tokens_list = sequence_encoder(seq_tokens_list, seq_masks)
+  │    ├─ q_tokens_list = CrossAttention(q_tokens_list, seq_tokens_list)
+  │    └─ q_tokens_list, ns_tokens = RankMixer(concat(q_tokens_list, ns_tokens))
+  ├─ out = concat(q_tokens_list)
+  ├─ out = output_proj(out)
+  └─ logits = classifier(out)
+```
+
+这条链路的设计意图是：用少量 `NS + Query` 压缩 token 作为信息枢纽，避免把所有非序列字段和所有历史行为都放入 full attention，从而控制复杂度并提升目标相关性。
+
+## 6. 关键模块的“为什么”与可替代方案
+
+### 6.1 NS Tokenizer
+
+- **作用**：把 user/item 非序列稀疏特征压缩为全局上下文 token。
+- **为什么这样用**：推荐特征多且稀疏，逐字段 token 化会使 token 数过多；NS token 是一种结构化压缩。
+- **替代方案**：字段级 attention pooling、field gate、hash embedding、共享 embedding + field embedding、关键字段单独成 token。
+
+### 6.2 Query Generator
+
+- **作用**：根据 `ns_tokens + sequence summary` 动态生成每个序列域的 query token。
+- **为什么这样用**：CVR 预测需要围绕当前 user-item 场景检索历史行为证据，动态 query 比静态 latent 更 target-aware。
+- **主要风险**：独立 FFN 参数量随 `num_sequences * num_queries` 增长；MeanPool summary 可能丢失少数关键行为。
+- **替代方案**：shared MLP + domain/query embedding、attention pooling、top-k pooling、recent-k pooling、Mamba/RWKV state pooling。
+
+### 6.3 Sequence Encoder
+
+- **作用**：把原始行为 token 更新为上下文化行为 token。
+- **为什么这样用**：Cross Attention 读取上下文化行为，比读取孤立事件更能捕捉兴趣演化。
+- **替代方案**：Mamba/Hyena/Linear Attention、session-aware encoder、多尺度 recent/long/top-k encoder。
+
+### 6.4 Cross Attention
+
+- **作用**：让少量 query token 从长序列中读取相关证据。
+- **为什么这样用**：复杂度约为 `O(num_queries * seq_len)`，比所有 token full attention 更适合长序列推荐。
+- **替代方案**：top-k sparse attention、带时间衰减 bias 的 attention、domain-specific head、可解释 attention 导出。
+
+### 6.5 RankMixer
+
+- **作用**：在所有 domain 的 query token 与 NS token 之间做跨域全局融合。
+- **为什么这样用**：多域行为不是孤立信号，RankMixer 在压缩 token 层面完成跨域路由，成本低于跨原始序列 full attention。
+- **替代方案**：domain gate、Sparse MoE FFN、shared memory tokens、LayerScale/residual scaling。
+
+### 6.6 Output Head
+
+- **作用**：把融合后的 query representation 转为 CVR logit。
+- **为什么这样用**：query token 已经过 NS 条件化、序列检索和跨域融合，是最目标相关的最终表征。
+- **替代方案**：拼接 NS summary、多任务 head、校准 head、不确定性 head。
+
+## 7. 优化空间优先级
+
+1. **Query token 质量**：优先尝试 attention pooling、shared FFN、`num_queries` 小网格。
+2. **长序列效率**：对比 `transformer`、`longer`，进一步可尝试 Mamba/Linear Attention。
+3. **跨域交互**：增加 domain gate 或 shared memory tokens。
+4. **训练稳定性**：学习率分组、梯度裁剪、dropout、分桶 AUC 诊断。
+5. **外部记忆**：引入用户长期兴趣原型、item 相似样本、ANN/Faiss retrieval memory。
+6. **辅助目标**：加入 CTR/CVR 多任务、InfoNCE、masked behavior modeling。

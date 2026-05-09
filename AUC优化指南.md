@@ -219,3 +219,95 @@
 ## 8. 总结
 
 AUC 提升通常需要“数据分布稳定 + 模型表示增强 + 训练策略稳健”三者协同。建议从**验证集切分 + 损失函数 + 编码器选择**这三条主线开始，先做小规模对比，再逐步扩展到参数与结构的系统调优。
+
+## 9. 结构级优化补充：围绕统一 Token 路由提升 AUC
+
+### 9.1 Query Generator 优化
+
+当前 Query Generator 是 AUC 提升优先级最高的模块，因为它决定模型从序列中“问什么”。
+
+建议：
+
+- **MeanPool → AttentionPool**：用当前 `NS/item` 上下文生成 pooling query，对序列 token 加权汇总。
+- **独立 FFN → shared FFN**：使用 `domain embedding + query slot embedding + shared MLP` 降低参数量并增强共享。
+- **控制 `num_queries`**：从 1、2、4 做小网格；query 过多可能增加噪声与过拟合。
+- **监控 query 多样性**：计算不同 query token 的余弦相似度，避免多个 query 学成同一个槽位。
+
+### 9.2 Sequence Pooling 与 Encoder 优化
+
+- 短序列：`transformer` 通常表达更强。
+- 长序列：优先尝试 `longer` 或 Recent-K/Top-K 预压缩。
+- 超长序列：可探索 Mamba、Hyena、Linear Attention。
+- 时间敏感行为：加入 time gap bucket、时间衰减 bias、最近行为加权。
+
+### 9.3 RankMixer 与跨域融合优化
+
+- `ffn_only` 更稳，适合作为 baseline。
+- `full` 表达更强，但受 `d_model % T == 0` 约束，且更容易过拟合。
+- 增加 domain gate，让模型按样本动态分配搜索、视频、电商等不同 domain 权重。
+- 对 RankMixer FFN 引入轻量 MoE，可适配不同用户群体与行为分布。
+
+### 9.4 NS Token 优化
+
+- 关键高价值 fid 单独成 token，避免被组内 pooling 稀释。
+- 弱字段或长尾字段进入 RankMixer 切块 token，减少噪声。
+- 对高基数字段使用 hash/OOV/frequency cutoff，降低 embedding 过拟合。
+- dense 特征拆成多个语义 token：活跃度、热度、价格/统计、时间上下文。
+
+### 9.5 Retrieval Memory 方向
+
+在当前架构中，Query token 已经像检索请求。进一步可加入外部 memory：
+
+```text
+query token / ns summary
+  -> ANN retrieval
+  -> memory tokens
+  -> CrossAttention / RankMixer
+  -> prediction head
+```
+
+可检索内容包括：
+
+- 用户长期兴趣原型；
+- 相似 item 的历史转化样本；
+- 用户簇 prototype；
+- 高转化行为路径；
+- session summary。
+
+注意必须按时间构造 memory，避免验证集或未来信息泄漏。
+
+## 10. 评估与诊断补充
+
+### 10.1 不要只看全局 AUC
+
+建议同时记录：
+
+- 按用户活跃度分桶 AUC；
+- 按 item 热度分桶 AUC；
+- 按 sequence length 分桶 AUC；
+- 按 domain 是否为空分桶 AUC；
+- 按时间窗口分桶 AUC；
+- logloss / calibration error。
+
+### 10.2 AUC 与 loss 分歧时如何判断
+
+- **AUC 上升，logloss 下降**：最理想。
+- **AUC 上升，logloss 上升**：排序更好但概率校准变差，可后处理校准。
+- **AUC 下降，logloss 下降**：概率更保守但排序变差，推荐排序场景通常不优先。
+- **训练 AUC 上升，验证 AUC 下降**：结构过拟合，优先降低 query 数、dropout/weight decay、简化 RankMixer。
+
+### 10.3 推荐消融顺序
+
+```text
+固定数据切分与 seed
+  -> BCE baseline
+  -> focal loss
+  -> transformer vs longer
+  -> num_queries 1/2/4
+  -> MeanPool vs AttentionPool
+  -> ffn_only vs full RankMixer
+  -> NS 分组调整
+  -> domain gate / MoE / retrieval memory
+```
+
+每轮只改一个变量，记录 best AUC、best logloss、early stopping 步数、训练耗时和显存，避免多个改动叠加后无法定位收益来源。
