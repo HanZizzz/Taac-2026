@@ -60,6 +60,69 @@
 - **融合强度**：尝试 `rank_mixer_mode=ffn_only` 或增加 `hidden_mult`，观察 AUC 是否更稳。
 - **序列池化策略**：目前是 MeanPool，可尝试基于时间衰减/Top-K 的池化（需改模型代码）。
 
+### 2.5.1 Cross Attention / LongerEncoder / RankMixer 专项优化空间
+
+这三块是当前模型最像“检索式推荐模型”的部分，建议单独做结构化消融。
+
+#### 2.5.1.1 调用链定位
+
+- `PCVRHyFormer.forward()` 先构造 NS tokens、序列 tokens 和 padding mask，再调用 `MultiSeqQueryGenerator` 生成每个序列域的 Q tokens。
+- `_run_multi_seq_blocks()` 会逐层调用 `MultiSeqHyFormerBlock`；每层内部先做序列编码，再用 Q 对对应序列做 `CrossAttention`，最后把所有 Q 与 NS tokens 拼接进 `RankMixerBlock`。
+- 因此该模块的优化目标不是单纯“加深 Transformer”，而是提升：
+  1. Q token 的检索意图质量；
+  2. 长序列压缩后的信息保真度；
+  3. 多序列域与 NS tokens 的跨域融合效率。
+
+#### 2.5.1.2 Q tokens 优化
+
+- **当前方式**：NS tokens 展平后与当前序列 MeanPool 拼接，再由每个序列域、每个 query 独立 FFN 生成 Q。
+- **风险**：MeanPool 会平均掉少数高价值行为；多个 query 可能学成重复语义；独立 FFN 参数量随 `num_sequences * num_queries` 增长。
+- **建议**：
+  - 先调 `num_queries=1/2/4`，同时检查 `rank_mixer_mode=full` 下的 $d\_model % T$ 约束。
+  - 将 MeanPool 升级为 time-decay pooling：近期行为权重大，旧行为权重小。
+  - 进一步可做 item-aware / ns-aware attention pooling：用候选 item 或 NS summary 作为 query 生成序列摘要。
+  - 若参数量过大，可改为 shared FFN + sequence embedding + query type embedding。
+
+#### 2.5.1.3 Cross Attention 优化
+
+- **当前方式**：Q tokens 作为 Query，sequence tokens 作为 Key/Value，输出仍为少量 Q tokens，相当于从历史行为中检索相关证据。
+- **优势**：复杂度为 $O(Nq \cdot L)$，比把所有 token 做 full self-attention 更适合长序列。
+- **建议**：
+  - 用 `num_queries` 控制检索槽位数量：1 更稳，2/4 更适合多兴趣但更容易冗余。
+  - 对 CrossAttention 增加诊断：attention entropy、不同 query 的关注位置重叠率、各序列域 Q norm。
+  - 如发现 Q 过度集中在最近 token，可加入 attention dropout 或 time bucket smoothing。
+  - 如发现 Q 无法聚焦，可增强 Q 生成器，而不是盲目加深序列 encoder。
+
+#### 2.5.1.4 LongerEncoder 优化
+
+- **当前方式**：当 `L > seq_top_k` 时，用最新 `seq_top_k` token 作为 Query，对全量序列做 Cross Attention 压缩；后续长度不超过 `seq_top_k` 后转为 self-attention 精炼。
+- **优势**：第一层完成“长历史读取”，后续层只在短序列上演化，显著降低复杂度。
+- **风险**：latest top-k 是强 recency 先验，但可能丢失远期高价值行为。
+- **建议**：
+  - 对 `seq_top_k=20/50/100/200` 做网格，对比整体 AUC 与长序列用户分桶 AUC。
+  - 将 latest top-k 升级为 hybrid selection：`latest top_m + relevance top_n + diversity top_r`。
+  - relevance scorer 可使用轻量 MLP：输入 sequence token、item/NS summary、time bucket，输出保留分数。
+  - 如果启用 RoPE，联动测试 `rope_base=10000/100000`，避免超长位置旋转过快。
+
+#### 2.5.1.5 RankMixer 优化
+
+- **当前方式**：所有 decoded Q 与 NS tokens 拼接后，`RankMixerBlock(full)` 通过 `view(B,T,T,d_sub) + transpose` 做参数无关 token mixing，再接共享 FFN。
+- **优势**：几乎零成本实现跨 token 子空间交换，适合 token 数不大但交互重要的推荐场景。
+- **约束**：`full` 模式要求 $d\_model % T == 0$，其中 $T=num\_queries*num\_sequences+num\_ns$。
+- **建议**：
+  - 先用 `rank_mixer_mode=ffn_only` 建立稳定基线，再切 `full` 观察收益。
+  - 若 `full` 失败或 AUC 波动，优先调整 `num_queries`、`user_ns_tokens`、`item_ns_tokens` 或 `d_model`，保证合理的 `d_sub=d_model/T`。
+  - 如果固定置换表达不足，可尝试 `RankMixer + low-rank token mixer`：在 RankMixer 后追加小型低秩 attention 或 gated token mixing。
+  - 记录 RankMixer 前后 token cosine similarity，若混合后 token 过度同质化，可提高 dropout 或降低 token 数。
+
+#### 2.5.1.6 推荐实验顺序
+
+1. **配置级消融**：`seq_encoder_type in {transformer,longer,swiglu}`、`rank_mixer_mode in {ffn_only,full}`、`seq_top_k in {20,50,100}`。
+2. **Q 质量优化**：MeanPool → time-decay pooling → item-aware attention pooling。
+3. **Top-K 策略优化**：latest top-k → latest + relevance hybrid top-k。
+4. **融合层优化**：RankMixer full → RankMixer + gated/low-rank learnable mixer。
+5. **长期方向**：外部 memory bank / ANN retrieval，把超长历史先离线召回为少量 memory tokens，再接入现有 CrossAttention。
+
 ### 2.6 基于 model.py 的可优化点（不改数据即可尝试）
 
 - **序列 RoPE 缓存上限**：`RotaryEmbedding` 默认 `max_seq_len=2048` 且不扩容。若序列长度 $L$ 超过 2048，会截断 RoPE 位置编码，影响长序列表达。
