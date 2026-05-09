@@ -116,6 +116,140 @@
 - 训练支持 `eval_every_n_steps` 进行 step-level 验证。
 - 建议：在 AUC 震荡时缩短评估间隔，避免过拟合后才发现。
 
+
+### 3.4 SwiGLU / 双优化器 / Loss 的专项优化空间
+
+这一节专门补充 `seq_encoder_type=swiglu`、Embedding Adagrad、Dense AdamW、BCE/Focal Loss 这几部分的调优空间。
+
+#### 3.4.1 `seq_encoder_type=swiglu` 的优化空间
+
+`swiglu` 的优势是轻量、稳定、无 `L^2` attention 成本；风险是序列 token 之间缺少显式交互。
+
+建议按以下路径优化：
+
+- **先把 `swiglu` 当吞吐基线**：在相同 `batch_size`、`d_model`、`num_layers` 下记录 samples/sec、显存峰值、AUC，作为和 `transformer` / `longer` 对比的基准。
+- **调 `hidden_mult`**：
+  - 欠拟合：`hidden_mult=4 -> 6/8`，增强通道非线性。
+  - 过拟合或延迟敏感：`hidden_mult=4 -> 2/3`，降低容量和计算。
+- **调 `num_layers`**：SwiGLU 单层表达弱于 attention，可以尝试用更多轻量层弥补；但层数增加会放大残差噪声，建议从 1/2/3 层小网格开始。
+- **调 `dropout_rate`**：
+  - AUC 训练高、验证低：提高到 `0.03~0.08`。
+  - AUC 整体上不去：降低到 `0.0~0.01`，避免轻量模型被过度正则。
+- **与 `num_queries` 联动**：SwiGLU 不做序列内部 attention，因此 Q tokens 的读取能力更关键。可尝试 `num_queries=1/2/4`，但要同步检查 RankMixer 的 token 数约束。
+- **与时间特征联动**：SwiGLU 本身不建模相对位置，建议保留 `use_time_buckets`；若切到 `transformer/longer` 再比较 `use_rope`。
+- **可改造方向**：在 `SwiGLUEncoder` 内加入 depthwise 1D conv、time-decay gate、target-aware gate，让轻量编码器具备局部序列交互或候选 item 感知能力。
+
+推荐实验矩阵：
+
+```text
+swiglu + hidden_mult=2/4/6
+swiglu + num_layers=1/2/3
+swiglu + num_queries=1/2/4
+swiglu + dropout_rate=0.0/0.01/0.03/0.05
+```
+
+#### 3.4.2 Embedding Adagrad 的优化空间
+
+Embedding 的主要矛盾是“高频 ID 稳定”和“长尾 ID 学得动”。当前用 Adagrad 是合理默认，但仍有优化空间：
+
+- **调 `sparse_lr`**：
+  - AUC 抖动、embedding norm 变大：降低 `sparse_lr`，如 `0.05 -> 0.02 -> 0.01`。
+  - 长尾特征无收益、训练 AUC 上升慢：尝试 `0.05 -> 0.08/0.1`。
+- **谨慎使用 `sparse_weight_decay`**：Embedding 通常不建议大 weight decay；如果要加，先从很小值开始。
+- **监控高基数特征**：`emb_skip_threshold` 过低会直接损失高价值 ID；显存允许时优先“hash/截断”而不是跳过。
+- **重初始化策略**：`reinit_sparse_after_epoch` 和 `reinit_cardinality_threshold` 适合作为去噪实验，不建议在没有对照实验时默认打开。
+- **更工程化的替代**：超大 embedding 可考虑 row-wise Adagrad、TorchRec/FBGEMM optimizer、分层 embedding table、冷热 ID 分表。
+
+建议实验顺序：
+
+```text
+固定 dense lr，先扫 sparse_lr
+再评估 emb_skip_threshold
+最后测试 sparse reinit 或 row-wise optimizer
+```
+
+#### 3.4.3 Dense AdamW 的优化空间
+
+Dense 参数包括 projection、attention、SwiGLU/FFN、RankMixer、output head。AdamW 是合理默认，但建议继续细化：
+
+- **调 `lr`**：AUC 抖动优先降 dense lr；欠拟合且 loss 下降慢可小幅升 lr。
+- **加入 warmup**：训练初期不稳时，建议加入 `3%~10%` steps 的 linear warmup。
+- **加入 decay schedule**：固定 lr 后期容易震荡，可用 cosine decay 或 step decay。
+- **参数组 weight decay**：LayerNorm/bias 通常不做 weight decay；Linear/FFN/Attention 可保留 weight decay。
+- **Head 使用更大学习率**：如果 backbone 已稳定但分类边界不够，可让 classifier/output head 使用 `1.5x~3x` lr。
+- **EMA/SWA**：验证 AUC 波动大时，可尝试 EMA 权重用于评估和保存 best checkpoint。
+
+推荐实验顺序：
+
+```text
+lr=1e-4/3e-4/5e-4
+warmup=0/3%/5%
+cosine decay vs fixed lr
+head lr multiplier=1/2
+```
+
+#### 3.4.4 BCE / Focal Loss 的优化空间
+
+Loss 选择需要和样本比例、负采样方式、评估指标一起看。
+
+- **BCE 作为稳定基线**：任何结构改动前先跑 BCE，确认模型和数据 pipeline 没有问题。
+- **Focal 主要用于 hard sample**：正负极不平衡、easy negative 过多时再打开。
+- **调 `focal_gamma`**：
+  - `gamma=0` 近似 BCE；
+  - `gamma=1` 温和关注 hard sample；
+  - `gamma=2` 常用默认；
+  - `gamma>=3` 可能过度关注噪声样本。
+- **调 `focal_alpha`**：当前实现中 positive 权重为 `alpha`，negative 权重为 `1-alpha`；原始正样本极少时要尝试 `alpha>0.5`，负采样后正样本比例较高时可尝试 `alpha<0.5`。
+- **观察 AUC 与 logloss 的 trade-off**：Focal 可能提升 AUC，但损害概率校准；如果线上需要 calibrated CVR，需要额外做 calibration。
+- **更进一步**：尝试 `pos_weight BCE`、sample-weighted BCE、pairwise AUC surrogate、listwise loss 或 CTR->CVR 多任务辅助。
+
+推荐实验矩阵：
+
+```text
+bce
+focal: gamma=1/2/3, alpha=0.25/0.5/0.75
+pos_weight BCE: pos_weight=neg_count/pos_count 的平滑版本
+```
+
+#### 3.4.5 联合调参优先级
+
+不要一次同时改太多。建议优先级：
+
+1. **数据与验证集稳定性**：先保证 AUC 可信。
+2. **BCE + swiglu 吞吐基线**：建立速度/显存/AUC baseline。
+3. **编码器对比**：`swiglu` vs `transformer` vs `longer`。
+4. **优化器学习率**：先 `lr`，再 `sparse_lr`，最后 schedule。
+5. **Loss 网格**：BCE 稳定后再试 Focal。
+6. **结构改造**：Conv-SwiGLU、target-aware Q、pairwise/listwise loss。
+
+一个推荐的低成本起点：
+
+```text
+--seq_encoder_type swiglu
+--hidden_mult 4
+--dropout_rate 0.01
+--loss_type bce
+--lr 3e-4
+--sparse_lr 0.05
+```
+
+如果验证 AUC 稳但偏低：
+
+```text
+增加 num_queries / hidden_mult
+尝试 focal gamma=1~2
+切 transformer 或 longer 对比
+```
+
+如果验证 AUC 抖动明显：
+
+```text
+降低 lr / sparse_lr
+提高 dropout_rate
+缩短 eval_every_n_steps
+尝试 rank_mixer_mode=ffn_only
+```
+
 ## 4. 评估与诊断
 
 ### 4.1 AUC 波动分析
