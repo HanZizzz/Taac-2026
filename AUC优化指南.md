@@ -27,10 +27,14 @@
 ## 2. 模型结构优化
 
 ### 2.1 NS Tokenizer 策略
-- `group` 模式：每组一个 token，语义清晰但 token 数固定。
-- `rankmixer` 模式：可调整 token 数，但需满足 $d\_model % T == 0$。
-- 建议：
-  - 若 AUC 无提升，可尝试切换模式或调 `user_ns_tokens`/`item_ns_tokens`。
+- `group` 模式：每组一个 token，语义清晰但 token 数固定。适合强业务先验明确、特征组边界稳定的场景。
+- `rankmixer` 模式：全部 fid embedding 按组顺序拼接、padding、均分为 `user_ns_tokens` / `item_ns_tokens` 个 chunk 后投影成 NS tokens，可调整 token 数，但需关注后续 RankMixer 的 $d\_model % T == 0$ 约束。
+- 优化空间：
+  - **token 数搜索**：以默认 `user_ns_tokens=5`、`item_ns_tokens=2` 为中心，尝试 `(4,2)`、`(6,2)`、`(5,3)`；若 AUC 提升但训练变慢，再压回更小 token 数。
+  - **fid 顺序重排**：`rankmixer` 仍依赖 groups 顺序，建议把语义相近、共现强的 fid 放在相邻位置，减少 chunk 内语义割裂。
+  - **高基数保留策略**：不要只依赖 `emb_skip_threshold` 粗暴跳过，可对高基数特征做 hash bucket、top-k 截断或独立成 token。
+  - **chunk padding 诊断**：若 `_pad_size / padded_total_dim` 过高，说明 token 数与总 embedding 维度不匹配，优先调整 token 数或 emb_dim。
+  - **group 与 rankmixer 对照**：使用相同训练步数对比 `group` 与 `rankmixer`，若 group 更稳但上限低，可把 group 的语义顺序迁移到 rankmixer 的 fid 排列中。
 
 ### 2.2 序列编码器选择
 - `swiglu`：轻量，可能欠拟合。
@@ -49,16 +53,22 @@
 - 建议：调参前先计算 T，避免因约束导致训练失败。
 
 ### 2.5 非序列与序列特征融合原理（基于实现）
-- **融合入口**：`MultiSeqQueryGenerator` 先生成每个序列域的 Q tokens，Q 来自 NS tokens 与该序列的 MeanPool，全局信息在此汇聚。
-- **融合方式**：`CrossAttention` 用 Q 作为 Query，序列 token 作为 Key/Value，实现“非序列 → 序列”的跨注意力注入。
-- **融合收敛**：所有域的 Q tokens 与 NS tokens 拼接后进入 `RankMixerBlock`，进行 token mixing + FFN，完成跨域融合。
+- **融合入口**：`MultiSeqQueryGenerator` 先生成每个序列域的 Q tokens，Q 来自 `flatten(NS tokens)` 与该序列的 masked MeanPool，全局信息在此汇聚。
+- **融合方式**：`CrossAttention` 用 Q 作为 Query，序列 token 作为 Key/Value，实现“带着全局上下文去序列中检索证据”。
+- **融合收敛**：所有域的 decoded Q tokens 与 NS tokens 拼接后进入 `RankMixerBlock`，进行 token mixing + FFN，完成跨域融合。
+- **多层迭代**：若 `num_hyformer_blocks > 1`，上一层融合后的 Q/NS 会进入下一层，使“生成检索目标 → 读取序列证据 → 跨域融合”的过程重复发生。
 
 基于 [model.py](model.py) 中 `MultiSeqQueryGenerator`、`CrossAttention`、`RankMixerBlock` 的实现，这套流程的核心是“**以 Q tokens 为桥梁，让非序列信息参与每个序列的注意力计算**”。
 
 可优化方向：
-- **Q tokens 数量**：调整 `num_queries`，避免 Q 太少导致表达不足或太多导致噪声。
-- **融合强度**：尝试 `rank_mixer_mode=ffn_only` 或增加 `hidden_mult`，观察 AUC 是否更稳。
-- **序列池化策略**：目前是 MeanPool，可尝试基于时间衰减/Top-K 的池化（需改模型代码）。
+- **Q tokens 数量**：调整 `num_queries`，避免 Q 太少导致表达不足或太多导致噪声；推荐从 `1/2/3` 做小网格，且每次检查 `T = num_queries * num_sequences + num_ns` 是否满足 RankMixer 约束。
+- **Q 生成方式**：在 FFN 生成 Q 的基础上加入 learnable base query 与 gate，例如 `Q = gate * dynamic_q + (1-gate) * base_q`，提高冷启动和短序列稳定性。
+- **GlobalInfo 构造**：当前使用 `NS_flat + seq_mean`，可尝试加入 last-k pooling、time-decay pooling、target item token 或 attentive pooling。优先尝试 time-decay/last-k，因为 PCVR 对近因行为敏感。
+- **序列摘要抗噪**：当长序列噪声大时，MeanPool 可能被弱行为稀释，可用按时间衰减的 weighted mean 替代。
+- **融合强度**：尝试 `rank_mixer_mode=ffn_only` 或 `full`；`ffn_only` 更适合作为稳定基线，`full` 更适合冲榜但要满足整除约束。
+- **跨域交互替代**：若 RankMixer 限制过强，可小规模试验 1 层轻量 Transformer 替代 `RankMixerBlock`，但需严控 dropout 和参数量。
+- **序列编码器**：对比 `swiglu`、`transformer`、`longer`；长序列或高噪声行为域优先看 `longer`，短序列优先看 `swiglu`。
+- **NS token 容量**：调 `user_ns_tokens`/`item_ns_tokens`，控制非序列信息容量；若 Q 的 attention 分布发散，先减少 NS token 或降低 `hidden_mult`。
 
 ### 2.6 基于 model.py 的可优化点（不改数据即可尝试）
 
@@ -91,14 +101,23 @@
   - 建议：在过拟合时增大 `dropout` 或降低 `num_heads`；在欠拟合时反向调整。
 - **`MultiSeqQueryGenerator`**：全局信息通过 `hidden_mult` 放大，可能引入噪声。
   - 建议：AUC 波动时降低 `hidden_mult` 或减少 `num_queries`。
+  - 进阶：加入 dynamic/static query gate；对短序列样本让 static query 占比更高，对长序列样本让 dynamic query 占比更高。
+  - 进阶：把 `MeanPool(Seq_i)` 替换为 `time_decay_mean + last_k_mean` 拼接后再投影，增强近因行为表达。
 - **`CrossAttention`**：Q 与序列对齐强度不足会削弱融合效果。
   - 建议：对比 `ln_mode=pre` 与 `post`，并配合 `num_queries` 做小网格。
+  - 进阶：记录 attention entropy，若 entropy 长期过高说明 Q 不聚焦，可降低 `num_queries` 或增强 target item 条件。
+  - 进阶：对不同序列域设置不同 `num_queries`，高价值序列域给更多 query，低价值域给更少 query。
 - **`RankMixerBlock`**：`full` 模式表达强但约束多，`ffn_only` 更稳但弱。
   - 建议：先用 `ffn_only` 作为稳定基线，再回到 `full` 做提升。
+  - 进阶：若 `full` 因整除约束限制超参，可固定 `d_model` 后搜索满足约束的 `T`，或将 `d_model` 调到 96/128 扩大可选组合。
+  - 进阶：在线上延迟允许时，用轻量 self-attention mixer 做 ablation，确认 RankMixer 是否成为表达瓶颈。
 - **`GroupNSTokenizer`**：组内池化可能掩盖高价值 fid。
   - 建议：对关键 fid 单独成组，或调大 `emb_dim` 提升容量。
+  - 进阶：将“强 ID 特征”和“弱画像特征”拆组，避免强信号被均值池化稀释。
 - **`RankMixerNSTokenizer`**：padding 造成信息稀释，分段过多会稀疏。
   - 建议：控制 `num_ns_tokens` 与 `d_model` 的配比，避免 chunk 过小。
+  - 进阶：检查每个 chunk 覆盖的 fid，避免一个 chunk 同时混入强 ID、弱统计和大量 padding。
+  - 进阶：把 item 侧 token 数作为重点调参项；PCVR 中 target item 条件往往比泛化用户画像更直接影响转化。
 
 ## 3. 训练策略优化
 
