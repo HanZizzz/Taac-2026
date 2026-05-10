@@ -502,7 +502,7 @@ class MultiSeqQueryGenerator(nn.Module):
 # Sequence Encoders
 # ═══════════════════════════════════════════════════════════════════════════════
 
-
+# 无注意力
 class SwiGLUEncoder(nn.Module):
     """Efficient attention-free sequence encoder.
 
@@ -544,7 +544,7 @@ class SwiGLUEncoder(nn.Module):
         x = residual + x
         return x, key_padding_mask
 
-
+# 自注意力
 class TransformerEncoder(nn.Module):
     """High-capacity sequence encoder with self-attention and RoPE.
 
@@ -617,6 +617,7 @@ class TransformerEncoder(nn.Module):
 
         return x, key_padding_mask
 
+# Top-k 压缩注意力
 class LongerEncoder(nn.Module):
     """Top-K compressed sequence encoder.
 
