@@ -20,7 +20,7 @@
 *.pkl
 
 # 检查点目录（如果整个目录都不需要追踪）
-# ckpt/
+ckpt/
 # checkpoints/
 
 # 数据集文件
@@ -37,6 +37,7 @@ logs/
 outputs/
 results/
 *.log
+tfevents/
 
 # Python缓存
 __pycache__/

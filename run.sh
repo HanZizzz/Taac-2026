@@ -1,8 +1,22 @@
 #!/bin/bash
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
+set -euo pipefail
 
-# ---- Active config: RankMixer NS tokenizer (no ns_groups.json required) ----
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH:-}"
+
+# 运行约定：
+# - 代码放在当前目录（或容器内挂载到 /workspace）
+# - 数据/日志/ckpt 位置通过环境变量控制
+# - 本地直接运行时保留默认目录，平台上建议显式覆盖这些环境变量
+: "${TRAIN_DATA_PATH:=${SCRIPT_DIR}/industrial_data}"
+: "${TRAIN_CKPT_PATH:=${SCRIPT_DIR}/ckpt}"
+: "${TRAIN_LOG_PATH:=${SCRIPT_DIR}/logs}"
+: "${TRAIN_TF_EVENTS_PATH:=${SCRIPT_DIR}/tfevents}"
+export TRAIN_DATA_PATH TRAIN_CKPT_PATH TRAIN_LOG_PATH TRAIN_TF_EVENTS_PATH
+
+# 腾讯平台 / Docker / 本地统一入口：
+# 默认走 RankMixer，不依赖 ns_groups.json；如需切 group tokenizer，
+# 可以在命令行里覆盖这些参数。
 python3 -u "${SCRIPT_DIR}/train.py" \
     --ns_tokenizer_type rankmixer \
     --user_ns_tokens 5 \
@@ -25,4 +39,17 @@ python3 -u "${SCRIPT_DIR}/train.py" \
 #     --num_queries 1 \
 #     --emb_skip_threshold 1000000 \
 #     --num_workers 8 \
+#     "$@"
+
+# 平台建议的线上参数示例：
+# python3 -u "${SCRIPT_DIR}/train.py" \
+#     --ns_tokenizer_type rankmixer \
+#     --user_ns_tokens 5 \
+#     --item_ns_tokens 2 \
+#     --num_queries 2 \
+#     --ns_groups_json "" \
+#     --emb_skip_threshold 1000000 \
+#     --num_workers 8 \
+#     --reinit_sparse_after_epoch 999 \
+#     --reinit_cardinality_threshold 1000000 \
 #     "$@"

@@ -21,6 +21,7 @@
 - `dataset.py` 采用文件系统共享张量，`num_workers` 过大可能导致稳定性问题。
 - `trainer.py` 采用双优化器：Embedding 使用 Adagrad，非 Embedding 使用 AdamW。
 - 根目录暂无测试用例；修改 `dataset.py` / `model.py` / `trainer.py` / `ns_groups.json` 时需谨慎。
+- 修改笔记录在相关文件中，每次修改后建议更新笔记以保持同步。
 
 ## 关键文件
 

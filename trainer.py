@@ -207,12 +207,18 @@ class PCVRHyFormerRankingTrainer:
         """Move all tensors in ``batch`` to ``self.device`` (``non_blocking=True``,
         to cooperate with ``pin_memory``). Non-tensor values pass through.
         """
+        def _move(value: Any) -> Any:
+            if isinstance(value, torch.Tensor):
+                return value.to(self.device, non_blocking=True)
+            if isinstance(value, dict):
+                return {k: _move(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return [_move(v) for v in value]
+            return value
+
         device_batch: Dict[str, Any] = {}
         for k, v in batch.items():
-            if isinstance(v, torch.Tensor):
-                device_batch[k] = v.to(self.device, non_blocking=True)
-            else:
-                device_batch[k] = v
+            device_batch[k] = _move(v)
         return device_batch
 
     def _handle_validation_result(
@@ -394,9 +400,11 @@ class PCVRHyFormerRankingTrainer:
             item_int_feats=device_batch['item_int_feats'],
             user_dense_feats=device_batch['user_dense_feats'],
             item_dense_feats=device_batch['item_dense_feats'],
+            engineered_dense_feats=device_batch.get('engineered_dense_feats'),
             seq_data=seq_data,
             seq_lens=seq_lens,
             seq_time_buckets=seq_time_buckets,
+            seq_engineered_feats=device_batch.get('seq_engineered_feats'),
         )
 
     def _train_step(self, batch: Dict[str, Any]) -> float:

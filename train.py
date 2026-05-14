@@ -84,6 +84,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--seq_max_lens', type=str,
                         default='seq_a:256,seq_b:256,seq_c:512,seq_d:512',
                         help='Per-domain sequence truncation, format: seq_d:256,seq_c:128')
+    parser.add_argument('--sidecar_config', type=str, default=None,
+                        help='Optional sidecar feature config JSON path')
 
     # Model hyperparameters.
     parser.add_argument('--d_model', type=int, default=64,
@@ -249,6 +251,7 @@ def main() -> None:
         buffer_batches=args.buffer_batches,
         seed=args.seed,
         seq_max_lens=seq_max_lens,
+        sidecar_config_path=args.sidecar_config,
     )
 
     # ---- NS groups ----
@@ -278,6 +281,8 @@ def main() -> None:
         "item_int_feature_specs": item_int_feature_specs,
         "user_dense_dim": pcvr_dataset.user_dense_schema.total_dim,
         "item_dense_dim": pcvr_dataset.item_dense_schema.total_dim,
+        "engineered_dense_dim": getattr(pcvr_dataset, 'engineered_dense_dim', 0),
+        "seq_engineered_dim": getattr(pcvr_dataset, 'seq_engineered_dim', 0),
         "seq_vocab_sizes": pcvr_dataset.seq_domain_vocab_sizes,
         "user_ns_groups": user_ns_groups,
         "item_ns_groups": item_ns_groups,

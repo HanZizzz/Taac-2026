@@ -13,9 +13,11 @@ class ModelInput(NamedTuple):
     item_int_feats: torch.Tensor
     user_dense_feats: torch.Tensor
     item_dense_feats: torch.Tensor
+    engineered_dense_feats: Optional[torch.Tensor]
     seq_data: dict        # {domain: tensor [B, S, L]}
     seq_lens: dict        # {domain: tensor [B]}
     seq_time_buckets: dict  # {domain: tensor [B, L]}
+    seq_engineered_feats: Optional[dict]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1215,6 +1217,8 @@ class PCVRHyFormer(nn.Module):
         # NS grouping config (grouped by fid index)
         user_ns_groups: List[List[int]],
         item_ns_groups: List[List[int]],
+        engineered_dense_dim: int = 0,
+        seq_engineered_dim: int = 0,
         # Model hyperparameters
         d_model: int = 64,
         emb_dim: int = 64,
@@ -1252,6 +1256,8 @@ class PCVRHyFormer(nn.Module):
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
+        self.engineered_dense_dim = engineered_dense_dim
+        self.seq_engineered_dim = seq_engineered_dim
 
         # ================== NS Tokens Construction ==================
 
@@ -1311,11 +1317,25 @@ class PCVRHyFormer(nn.Module):
                 nn.LayerNorm(d_model),
             )
 
+        self.has_engineered_dense = engineered_dense_dim > 0
+        if self.has_engineered_dense:
+            self.engineered_dense_proj = nn.Sequential(
+                nn.Linear(engineered_dense_dim, d_model),
+                nn.LayerNorm(d_model),
+            )
+
         # Item dense feature projection (if available)
         self.has_item_dense = item_dense_dim > 0
         if self.has_item_dense:
             self.item_dense_proj = nn.Sequential(
                 nn.Linear(item_dense_dim, d_model),
+                nn.LayerNorm(d_model),
+            )
+
+        self.has_seq_engineered = seq_engineered_dim > 0
+        if self.has_seq_engineered:
+            self.seq_engineered_proj = nn.Sequential(
+                nn.Linear(seq_engineered_dim, d_model),
                 nn.LayerNorm(d_model),
             )
 
@@ -1648,6 +1668,10 @@ class PCVRHyFormer(nn.Module):
         ns_parts = [user_ns]
         if self.has_user_dense:
             user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)  # (B, 1, D)
+            if self.has_engineered_dense and inputs.engineered_dense_feats is not None:
+                user_dense_tok = user_dense_tok + F.silu(
+                    self.engineered_dense_proj(inputs.engineered_dense_feats)
+                ).unsqueeze(1)
             ns_parts.append(user_dense_tok)
         ns_parts.append(item_ns)
         if self.has_item_dense:
@@ -1665,6 +1689,10 @@ class PCVRHyFormer(nn.Module):
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
                 inputs.seq_time_buckets[domain])
+            if self.has_seq_engineered and inputs.seq_engineered_feats is not None:
+                domain_stats = inputs.seq_engineered_feats.get(domain)
+                if domain_stats is not None:
+                    tokens = tokens + F.silu(self.seq_engineered_proj(domain_stats)).unsqueeze(1)
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
@@ -1691,6 +1719,10 @@ class PCVRHyFormer(nn.Module):
         ns_parts = [user_ns]
         if self.has_user_dense:
             user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)
+            if self.has_engineered_dense and inputs.engineered_dense_feats is not None:
+                user_dense_tok = user_dense_tok + F.silu(
+                    self.engineered_dense_proj(inputs.engineered_dense_feats)
+                ).unsqueeze(1)
             ns_parts.append(user_dense_tok)
         ns_parts.append(item_ns)
         if self.has_item_dense:
@@ -1707,6 +1739,10 @@ class PCVRHyFormer(nn.Module):
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
                 inputs.seq_time_buckets[domain])
+            if self.has_seq_engineered and inputs.seq_engineered_feats is not None:
+                domain_stats = inputs.seq_engineered_feats.get(domain)
+                if domain_stats is not None:
+                    tokens = tokens + F.silu(self.seq_engineered_proj(domain_stats)).unsqueeze(1)
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)

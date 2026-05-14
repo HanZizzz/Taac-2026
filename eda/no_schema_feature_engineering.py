@@ -326,3 +326,11 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+"""
+python eda/no_schema_feature_engineering.py \
+  --input-dir ../industrual_data/ \
+  --schema-path /path/to/schema.json \
+  --output-path /tmp/taac_sidecar_features.parquet
+"""

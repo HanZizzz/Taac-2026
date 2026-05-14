@@ -1,0 +1,12 @@
+{
+  "path": "eda/taac_sidecar_features.parquet",
+  "key": "row_id",
+  "user_int": [
+    {"name": "fe_user_id__freq_in_input", "vocab_size": 1000000}
+  ],
+  "item_int": [],
+  "user_dense": [
+    {"name": "fe_seq_a__log1p_len"}
+  ],
+  "item_dense": []
+}

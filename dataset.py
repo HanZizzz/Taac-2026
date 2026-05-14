@@ -16,6 +16,7 @@ import logging
 import random
 import json
 import gc
+from dataclasses import dataclass
 
 import numpy as np
 import pyarrow as pa
@@ -120,6 +121,10 @@ BUCKET_BOUNDARIES = np.array([
     31536000,
 ], dtype=np.int64)
 
+# Extra sequence statistics are computed over a few fixed recent windows.
+# These are expressed in the same timestamp units as the raw parquet data.
+SEQ_RECENT_WINDOWS = (3600, 86400, 604800)
+
 # Total number of time-bucket embedding slots (= number of boundaries + 1, with
 # padding=0 included).
 #
@@ -130,6 +135,71 @@ BUCKET_BOUNDARIES = np.array([
 # That is why ``train.py`` / ``infer.py`` only expose the boolean flag
 # ``--use_time_buckets`` and derive the concrete bucket count from here.
 NUM_TIME_BUCKETS = len(BUCKET_BOUNDARIES) + 1
+
+
+@dataclass(frozen=True)
+class SidecarFeatureSpec:
+    name: str
+    dim: int
+    vocab_size: int
+    fid: int
+
+
+class SidecarFeatureStore:
+    """Loads a sidecar parquet table and provides row-based lookups."""
+
+    def __init__(self, path: str, key: str, columns: List[str]) -> None:
+        table = pq.read_table(path, columns=[key] + columns if key else columns)
+        self._columns: Dict[str, np.ndarray] = {}
+        self.num_rows = table.num_rows
+
+        if key:
+            row_ids = table.column(key).to_numpy(zero_copy_only=False)
+            if len(row_ids) != self.num_rows:
+                raise ValueError("Sidecar key length mismatch")
+            expected = np.arange(self.num_rows, dtype=row_ids.dtype)
+            if not np.array_equal(row_ids, expected):
+                raise ValueError(
+                    "Sidecar row_id is not a contiguous 0..N-1 sequence. "
+                    "Please regenerate with sequential row_id."
+                )
+
+        for name in columns:
+            self._columns[name] = table.column(name).to_numpy(zero_copy_only=False)
+
+    def take(self, name: str, row_ids: np.ndarray) -> np.ndarray:
+        return self._columns[name][row_ids]
+
+
+def _normalize_sidecar_specs(
+    specs: List[Dict[str, Any]],
+    start_fid: int,
+) -> List[SidecarFeatureSpec]:
+    next_fid = start_fid
+    out: List[SidecarFeatureSpec] = []
+    for spec in specs:
+        name = spec['name']
+        dim = int(spec.get('dim', 1))
+        vocab_size = int(spec.get('vocab_size', 0))
+        fid = int(spec.get('fid', next_fid))
+        if fid == next_fid:
+            next_fid += 1
+        if dim <= 0:
+            raise ValueError(f"Sidecar feature {name} has invalid dim {dim}")
+        out.append(SidecarFeatureSpec(name=name, dim=dim, vocab_size=vocab_size, fid=fid))
+    return out
+
+
+def _copy_schema_with_sidecar(
+    base: FeatureSchema,
+    specs: List[SidecarFeatureSpec],
+) -> FeatureSchema:
+    new_schema = FeatureSchema()
+    for fid, _, length in base.entries:
+        new_schema.add(fid, length)
+    for spec in specs:
+        new_schema.add(spec.fid, spec.dim)
+    return new_schema
 
 
 class PCVRParquetDataset(IterableDataset):
@@ -188,16 +258,21 @@ class PCVRParquetDataset(IterableDataset):
         self.buffer_batches = buffer_batches
         self.clip_vocab = clip_vocab
         self.is_training = is_training
+        self.engineered_dense_dim = 0
+        self.seq_engineered_dim = 0
         # Out-of-bound statistics:
         #   {(group, col_idx): {'count': N, 'max': M, 'min_oob': M, 'vocab': V}}
         self._oob_stats: Dict[Tuple[str, int], Dict[str, int]] = {}
 
         # Build the list of Row Groups.
         self._rg_list = []
+        row_start = 0
         for f in self._parquet_files:
             pf = pq.ParquetFile(f)
             for i in range(pf.metadata.num_row_groups):
-                self._rg_list.append((f, i, pf.metadata.row_group(i).num_rows))
+                num_rows = pf.metadata.row_group(i).num_rows
+                self._rg_list.append((f, i, num_rows, row_start))
+                row_start += num_rows
 
         if row_group_range is not None:
             start, end = row_group_range
@@ -212,6 +287,14 @@ class PCVRParquetDataset(IterableDataset):
         pf = pq.ParquetFile(self._parquet_files[0])
         schema_names = pf.schema_arrow.names
         self._col_idx = {name: i for i, name in enumerate(schema_names)}
+        required_cols = ['timestamp', 'label_type', 'user_id']
+        missing_required = [name for name in required_cols if name not in self._col_idx]
+        if missing_required:
+            raise KeyError(
+                f"Base parquet is missing required column(s): {missing_required}. "
+                f"Check that TRAIN_DATA_PATH points to the original training parquet directory, "
+                f"not a sidecar parquet or a split sidecar output directory."
+            )
 
         # ---- Pre-allocate numpy buffers ----
         B = batch_size
@@ -329,10 +412,13 @@ class PCVRParquetDataset(IterableDataset):
             # max_len: from seq_max_lens arg; unspecified domains fall back to 256.
             self._seq_maxlen[domain] = seq_max_lens.get(domain, 256)
 
+        self.seq_engineered_dim = 13
+        self.engineered_dense_dim = 14 + len(self.seq_domains) * self.seq_engineered_dim
+
     def __len__(self) -> int:
         # Ceiling per Row Group; this is an upper bound on the true batch count.
         return sum((n + self.batch_size - 1) // self.batch_size
-                   for _, _, n in self._rg_list)
+                   for _, _, n, _ in self._rg_list)
 
     def __iter__(self) -> Iterator[Dict[str, Any]]:
         worker_info = torch.utils.data.get_worker_info()
@@ -342,10 +428,18 @@ class PCVRParquetDataset(IterableDataset):
                        if i % worker_info.num_workers == worker_info.id]
 
         buffer: List[Dict[str, Any]] = []
-        for file_path, rg_idx, _ in rg_list:
+        for file_path, rg_idx, _, rg_row_start in rg_list:
             pf = pq.ParquetFile(file_path)
+            row_offset = 0
             for batch in pf.iter_batches(batch_size=self.batch_size, row_groups=[rg_idx]):
-                batch_dict = self._convert_batch(batch)
+                batch_size = batch.num_rows
+                row_ids = np.arange(
+                    rg_row_start + row_offset,
+                    rg_row_start + row_offset + batch_size,
+                    dtype=np.int64,
+                )
+                row_offset += batch_size
+                batch_dict = self._convert_batch(batch, row_ids=row_ids)
                 if self.shuffle and self.buffer_batches > 1:
                     buffer.append(batch_dict)
                     if len(buffer) >= self.buffer_batches:
@@ -367,10 +461,16 @@ class PCVRParquetDataset(IterableDataset):
         re-slice and yield batch-sized chunks.
         """
         merged: Dict[str, torch.Tensor] = {}
+        merged_dicts: Dict[str, Dict[str, torch.Tensor]] = {}
         non_tensor_keys: Dict[str, Any] = {}
         for k in buffer[0].keys():
             if isinstance(buffer[0][k], torch.Tensor):
                 merged[k] = torch.cat([b[k] for b in buffer], dim=0)
+            elif isinstance(buffer[0][k], dict):
+                merged_dicts[k] = {
+                    sub_k: torch.cat([b[k][sub_k] for b in buffer], dim=0)
+                    for sub_k in buffer[0][k].keys()
+                }
             else:
                 non_tensor_keys[k] = buffer[0][k]
         total_rows = merged['label'].shape[0]
@@ -378,9 +478,12 @@ class PCVRParquetDataset(IterableDataset):
         for i in range(0, total_rows, self.batch_size):
             end = min(i + self.batch_size, total_rows)
             batch: Dict[str, Any] = {k: v[rand_idx[i:end]] for k, v in merged.items()}
+            for k, sub_dict in merged_dicts.items():
+                batch[k] = {sub_k: sub_v[rand_idx[i:end]] for sub_k, sub_v in sub_dict.items()}
             batch.update(non_tensor_keys)
             yield batch
         del merged
+        del merged_dicts
         buffer.clear()
 
     # ---- Helpers ----
@@ -389,7 +492,7 @@ class PCVRParquetDataset(IterableDataset):
         self,
         group: str,
         col_idx: int,
-        arr: "npt.NDArray[np.int64]",
+        arr: np.ndarray,
         vocab_size: int,
     ) -> None:
         """Record out-of-bound indices and (optionally) clip them to 0,
@@ -447,7 +550,7 @@ class PCVRParquetDataset(IterableDataset):
         arrow_col: "pa.ListArray",
         max_len: int,
         B: int,
-    ) -> Tuple["npt.NDArray[np.int64]", "npt.NDArray[np.int64]"]:
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """Pad an Arrow ``ListArray`` of ints to shape ``[B, max_len]``.
 
         Values <= 0 are mapped to 0 (padding). Note: the raw data contains -1
@@ -485,12 +588,13 @@ class PCVRParquetDataset(IterableDataset):
         arrow_col: "pa.ListArray",
         max_dim: int,
         B: int,
-    ) -> "npt.NDArray[np.float32]":
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """Pad an Arrow ``ListArray<float>`` to shape ``[B, max_dim]``."""
         offsets = arrow_col.offsets.to_numpy()
         values = arrow_col.values.to_numpy()
 
         padded = np.zeros((B, max_dim), dtype=np.float32)
+        lengths = np.zeros(B, dtype=np.int64)
 
         for i in range(B):
             start, end = int(offsets[i]), int(offsets[i + 1])
@@ -499,12 +603,19 @@ class PCVRParquetDataset(IterableDataset):
                 continue
             use_len = min(raw_len, max_dim)
             padded[i, :use_len] = values[start:start + use_len]
+            lengths[i] = use_len
 
-        return padded
+        return padded, lengths
 
-    def _convert_batch(self, batch: "pa.RecordBatch") -> Dict[str, Any]:
+    def _convert_batch(
+        self,
+        batch: "pa.RecordBatch",
+        row_ids: Optional[np.ndarray] = None,
+    ) -> Dict[str, Any]:
         """Convert an Arrow RecordBatch into a training-ready dict of tensors."""
         B = batch.num_rows
+        engineered_dense_parts: List[np.ndarray] = []
+        seq_engineered_feats: Dict[str, torch.Tensor] = {}
 
         # ---- meta ----
         timestamps = batch.column(self._col_idx['timestamp']).to_numpy().astype(np.int64)
@@ -565,10 +676,38 @@ class PCVRParquetDataset(IterableDataset):
         # ---- user_dense ----
         user_dense = self._buf_user_dense[:B]
         user_dense[:] = 0
+        user_dense_valid_len_total = np.zeros(B, dtype=np.float32)
+        user_dense_non_empty_cnt = np.zeros(B, dtype=np.float32)
         for ci, dim, offset in self._user_dense_plan:
             col = batch.column(ci)
-            padded = self._pad_varlen_float_column(col, dim, B)
+            padded, lengths = self._pad_varlen_float_column(col, dim, B)
             user_dense[:, offset:offset + dim] = padded
+            user_dense_valid_len_total += lengths.astype(np.float32)
+            user_dense_non_empty_cnt += (lengths > 0).astype(np.float32)
+
+        user_dense_total_dim = float(max(user_dense.shape[1], 1))
+        user_dense_valid_ratio = user_dense_valid_len_total / user_dense_total_dim
+        user_dense_missing_ratio = np.clip(1.0 - user_dense_valid_ratio, 0.0, 1.0)
+        user_dense_non_empty_ratio = user_dense_non_empty_cnt / float(max(len(self._user_dense_plan), 1))
+
+        user_nonzero_ratio = (
+            np.count_nonzero(user_int, axis=1).astype(np.float32)
+            / float(max(user_int.shape[1], 1))
+        )
+        item_nonzero_ratio = (
+            np.count_nonzero(item_int, axis=1).astype(np.float32)
+            / float(max(item_int.shape[1], 1))
+        )
+        user_dense_nonzero_ratio = (
+            np.count_nonzero(user_dense, axis=1).astype(np.float32)
+            / float(max(user_dense.shape[1], 1))
+        )
+        total_seq_capacity = float(sum(self._seq_maxlen[domain] for domain in self.seq_domains))
+        seq_total_len = np.zeros(B, dtype=np.float32)
+        seq_active_domain_cnt = np.zeros(B, dtype=np.float32)
+        seq_recent_gap_mean = np.zeros(B, dtype=np.float32)
+        seq_burst_mean = np.zeros(B, dtype=np.float32)
+        seq_domain_len_history: List[np.ndarray] = []
 
         result = {
             'user_int_feats': torch.from_numpy(user_int.copy()),
@@ -580,6 +719,8 @@ class PCVRParquetDataset(IterableDataset):
             'user_id': user_ids,
             '_seq_domains': self.seq_domains,
         }
+        if row_ids is not None:
+            result['row_id'] = torch.from_numpy(row_ids.copy())
 
         # ---- Sequence features: fused padding directly into the 3D buffer ----
         for domain in self.seq_domains:
@@ -666,7 +807,244 @@ class PCVRParquetDataset(IterableDataset):
 
             result[f'{domain}_time_bucket'] = torch.from_numpy(time_bucket.copy())
 
+            domain_len = lengths.astype(np.float32)
+            domain_len_norm = domain_len / float(max(max_len, 1))
+            domain_len_log = np.log1p(domain_len) / float(np.log1p(max(max_len, 1)))
+            domain_recent_gap_log = np.zeros(B, dtype=np.float32)
+            domain_span_log = np.zeros(B, dtype=np.float32)
+            domain_cnt_1h = np.zeros(B, dtype=np.float32)
+            domain_cnt_1d = np.zeros(B, dtype=np.float32)
+            domain_cnt_7d = np.zeros(B, dtype=np.float32)
+            domain_burst_1h_7d = np.zeros(B, dtype=np.float32)
+            domain_burst_1d_7d = np.zeros(B, dtype=np.float32)
+            domain_bucket_mean = np.zeros(B, dtype=np.float32)
+            domain_bucket_min = np.zeros(B, dtype=np.float32)
+            domain_unique_norm = np.zeros(B, dtype=np.float32)
+            domain_dup_ratio = np.zeros(B, dtype=np.float32)
+            for i in range(B):
+                use_len = int(lengths[i])
+                if use_len <= 0:
+                    continue
+                tb = time_bucket[i, :use_len]
+                tb = tb[tb > 0]
+                if tb.size == 0:
+                    continue
+                domain_bucket_mean[i] = np.float32(tb.mean() / float(NUM_TIME_BUCKETS))
+                domain_bucket_min[i] = np.float32(tb.min() / float(NUM_TIME_BUCKETS))
+
+                valid_ts = ts_padded[i, :use_len]
+                valid_ts = valid_ts[valid_ts > 0]
+                if valid_ts.size == 0:
+                    continue
+                valid_td = np.maximum(timestamps[i] - valid_ts, 0)
+                seq_vals = out[i, :, :use_len].reshape(-1)
+                seq_vals = seq_vals[seq_vals > 0]
+                recent_gap = float(valid_td.min())
+                span_gap = float(valid_td.max() - valid_td.min()) if valid_td.size > 1 else 0.0
+                domain_recent_gap_log[i] = np.float32(
+                    np.log1p(recent_gap) / float(np.log1p(BUCKET_BOUNDARIES[-1]))
+                )
+                domain_span_log[i] = np.float32(
+                    np.log1p(span_gap) / float(np.log1p(BUCKET_BOUNDARIES[-1]))
+                )
+
+                cnt_1h = float(np.count_nonzero(valid_td <= SEQ_RECENT_WINDOWS[0]))
+                cnt_1d = float(np.count_nonzero(valid_td <= SEQ_RECENT_WINDOWS[1]))
+                cnt_7d = float(np.count_nonzero(valid_td <= SEQ_RECENT_WINDOWS[2]))
+                domain_cnt_1h[i] = np.float32(cnt_1h / float(max(use_len, 1)))
+                domain_cnt_1d[i] = np.float32(cnt_1d / float(max(use_len, 1)))
+                domain_cnt_7d[i] = np.float32(cnt_7d / float(max(use_len, 1)))
+                denom_7d = max(cnt_7d, 1.0)
+                domain_burst_1h_7d[i] = np.float32(cnt_1h / denom_7d)
+                domain_burst_1d_7d[i] = np.float32(cnt_1d / denom_7d)
+                if seq_vals.size > 0:
+                    unique_cnt = float(np.unique(seq_vals).size)
+                    seq_size = float(max(seq_vals.size, 1))
+                    domain_unique_norm[i] = np.float32(unique_cnt / seq_size)
+                    domain_dup_ratio[i] = np.float32(1.0 - unique_cnt / seq_size)
+
+                seq_recent_gap_mean[i] += domain_recent_gap_log[i]
+                seq_burst_mean[i] += domain_burst_1h_7d[i]
+
+            seq_stats = np.stack([
+                domain_len_norm,
+                domain_len_log,
+                domain_recent_gap_log,
+                domain_span_log,
+                domain_cnt_1h,
+                domain_cnt_1d,
+                domain_cnt_7d,
+                domain_burst_1h_7d,
+                domain_burst_1d_7d,
+                domain_bucket_mean,
+                domain_bucket_min,
+                domain_unique_norm,
+                domain_dup_ratio,
+            ], axis=1).astype(np.float32, copy=False)
+            seq_engineered_feats[domain] = torch.from_numpy(np.ascontiguousarray(seq_stats))
+            engineered_dense_parts.append(seq_stats)
+            seq_total_len += domain_len
+            seq_active_domain_cnt += (lengths > 0).astype(np.float32)
+            seq_domain_len_history.append(domain_len)
+
+        seq_domain_count = float(max(len(self.seq_domains), 1))
+        seq_recent_gap_mean /= seq_domain_count
+        seq_burst_mean /= seq_domain_count
+
+        if seq_domain_len_history:
+            seq_domain_len_matrix = np.stack(seq_domain_len_history, axis=1)
+            seq_total_len_safe = np.maximum(seq_total_len, 1.0)
+            seq_domain_share = seq_domain_len_matrix / seq_total_len_safe[:, None]
+            seq_domain_share = np.where(seq_domain_len_matrix > 0, seq_domain_share, 0.0)
+            seq_domain_share_sum = seq_domain_share.sum(axis=1)
+            seq_length_entropy = np.zeros(B, dtype=np.float32)
+            valid_share_mask = seq_domain_share_sum > 0
+            if valid_share_mask.any():
+                safe_share = np.clip(seq_domain_share[valid_share_mask], 1e-12, 1.0)
+                seq_length_entropy[valid_share_mask] = (
+                    -np.sum(safe_share * np.log(safe_share), axis=1)
+                    / float(np.log(max(len(self.seq_domains), 2)))
+                ).astype(np.float32)
+            seq_max_domain_share = seq_domain_share.max(axis=1).astype(np.float32)
+        else:
+            seq_length_entropy = np.zeros(B, dtype=np.float32)
+            seq_max_domain_share = np.zeros(B, dtype=np.float32)
+
+        global_seq_stats = np.stack([
+            user_nonzero_ratio,
+            item_nonzero_ratio,
+            user_dense_nonzero_ratio,
+            1.0 - user_nonzero_ratio,
+            1.0 - item_nonzero_ratio,
+            user_dense_valid_ratio,
+            user_dense_missing_ratio,
+            seq_total_len / float(max(total_seq_capacity, 1.0)),
+            seq_active_domain_cnt / float(max(len(self.seq_domains), 1)),
+            seq_recent_gap_mean,
+            seq_burst_mean,
+            user_dense_non_empty_ratio,
+            seq_length_entropy,
+            seq_max_domain_share,
+        ], axis=1).astype(np.float32, copy=False)
+
+        engineered_dense = np.concatenate([global_seq_stats] + engineered_dense_parts, axis=1)
+        result['engineered_dense_feats'] = torch.from_numpy(np.ascontiguousarray(engineered_dense))
+        result['seq_engineered_feats'] = seq_engineered_feats
+
         return result
+
+
+class SidecarMergedDataset(IterableDataset):
+    """Merge sidecar features into the base PCVRParquetDataset batches."""
+
+    def __init__(
+        self,
+        base: PCVRParquetDataset,
+        store: SidecarFeatureStore,
+        user_int_specs: List[SidecarFeatureSpec],
+        item_int_specs: List[SidecarFeatureSpec],
+        user_dense_specs: List[SidecarFeatureSpec],
+        item_dense_specs: List[SidecarFeatureSpec],
+    ) -> None:
+        super().__init__()
+        self.base = base
+        self.store = store
+        self.user_int_specs = user_int_specs
+        self.item_int_specs = item_int_specs
+        self.user_dense_specs = user_dense_specs
+        self.item_dense_specs = item_dense_specs
+
+        self.user_int_schema = _copy_schema_with_sidecar(base.user_int_schema, user_int_specs)
+        self.item_int_schema = _copy_schema_with_sidecar(base.item_int_schema, item_int_specs)
+        self.user_dense_schema = _copy_schema_with_sidecar(base.user_dense_schema, user_dense_specs)
+        self.item_dense_schema = _copy_schema_with_sidecar(base.item_dense_schema, item_dense_specs)
+
+        self.user_int_vocab_sizes = base.user_int_vocab_sizes + [
+            spec.vocab_size for spec in user_int_specs for _ in range(spec.dim)
+        ]
+        self.item_int_vocab_sizes = base.item_int_vocab_sizes + [
+            spec.vocab_size for spec in item_int_specs for _ in range(spec.dim)
+        ]
+
+        self.seq_domains = base.seq_domains
+        self.seq_vocab_sizes = base.seq_vocab_sizes
+        self.seq_domain_vocab_sizes = base.seq_domain_vocab_sizes
+        self.num_rows = base.num_rows
+        self.engineered_dense_dim = getattr(base, 'engineered_dense_dim', 0)
+        self.seq_engineered_dim = getattr(base, 'seq_engineered_dim', 0)
+
+    def __len__(self) -> int:
+        return len(self.base)
+
+    def __iter__(self) -> Iterator[Dict[str, Any]]:
+        for batch in self.base:
+            row_ids = batch.get('row_id')
+            if row_ids is None:
+                raise ValueError("row_id missing; enable row_id in base dataset")
+            row_idx = row_ids.cpu().numpy()
+
+            if self.user_int_specs:
+                extra = self._collect_int_features(row_idx, self.user_int_specs)
+                batch['user_int_feats'] = torch.cat([batch['user_int_feats'], extra], dim=1)
+            if self.item_int_specs:
+                extra = self._collect_int_features(row_idx, self.item_int_specs)
+                batch['item_int_feats'] = torch.cat([batch['item_int_feats'], extra], dim=1)
+            if self.user_dense_specs:
+                extra = self._collect_dense_features(row_idx, self.user_dense_specs)
+                batch['user_dense_feats'] = torch.cat([batch['user_dense_feats'], extra], dim=1)
+            if self.item_dense_specs:
+                extra = self._collect_dense_features(row_idx, self.item_dense_specs)
+                if batch['item_dense_feats'].numel() == 0:
+                    batch['item_dense_feats'] = extra
+                else:
+                    batch['item_dense_feats'] = torch.cat([batch['item_dense_feats'], extra], dim=1)
+
+            yield batch
+
+    def _collect_int_features(
+        self,
+        row_idx: np.ndarray,
+        specs: List[SidecarFeatureSpec],
+    ) -> torch.Tensor:
+        cols: List[np.ndarray] = []
+        for spec in specs:
+            arr = self.store.take(spec.name, row_idx)
+            if arr.ndim == 1:
+                if spec.dim != 1:
+                    raise ValueError(f"Sidecar {spec.name} expects dim={spec.dim}")
+                arr = arr.reshape(-1, 1)
+            elif arr.ndim == 2 and arr.shape[1] != spec.dim:
+                raise ValueError(f"Sidecar {spec.name} expects dim={spec.dim}, got {arr.shape[1]}")
+            arr = arr.astype(np.int64, copy=False)
+            arr[arr <= 0] = 0
+            if spec.vocab_size > 0:
+                arr[arr >= spec.vocab_size] = 0
+            cols.append(arr)
+        merged = np.concatenate(cols, axis=1) if cols else np.zeros((len(row_idx), 0), dtype=np.int64)
+        return torch.from_numpy(np.ascontiguousarray(merged))
+
+    def _collect_dense_features(
+        self,
+        row_idx: np.ndarray,
+        specs: List[SidecarFeatureSpec],
+    ) -> torch.Tensor:
+        cols: List[np.ndarray] = []
+        for spec in specs:
+            arr = self.store.take(spec.name, row_idx)
+            if arr.ndim == 1:
+                if spec.dim != 1:
+                    raise ValueError(f"Sidecar {spec.name} expects dim={spec.dim}")
+                arr = arr.reshape(-1, 1)
+            elif arr.ndim == 2 and arr.shape[1] != spec.dim:
+                raise ValueError(f"Sidecar {spec.name} expects dim={spec.dim}, got {arr.shape[1]}")
+            cols.append(arr.astype(np.float32, copy=False))
+        merged = np.concatenate(cols, axis=1) if cols else np.zeros((len(row_idx), 0), dtype=np.float32)
+        return torch.from_numpy(np.ascontiguousarray(merged))
+
+
+def _load_sidecar_config(path: str) -> Dict[str, Any]:
+    with open(path, 'r', encoding='utf-8') as f:
+        return json.load(f)
 
 
 def get_pcvr_data(
@@ -681,6 +1059,7 @@ def get_pcvr_data(
     seed: int = 42,
     clip_vocab: bool = True,
     seq_max_lens: Optional[Dict[str, int]] = None,
+    sidecar_config_path: Optional[str] = None,
     **kwargs: Any,
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
@@ -720,7 +1099,7 @@ def get_pcvr_data(
     logging.info(f"Row Group split: {n_train_rgs} train ({train_rows} rows), "
                  f"{n_valid_rgs} valid ({valid_rows} rows)")
 
-    train_dataset = PCVRParquetDataset(
+    train_dataset: PCVRParquetDataset = PCVRParquetDataset(
         parquet_path=data_dir,
         schema_path=schema_path,
         batch_size=batch_size,
@@ -730,6 +1109,65 @@ def get_pcvr_data(
         row_group_range=(0, n_train_rgs),
         clip_vocab=clip_vocab,
     )
+    valid_dataset: PCVRParquetDataset = PCVRParquetDataset(
+        parquet_path=data_dir,
+        schema_path=schema_path,
+        batch_size=batch_size,
+        seq_max_lens=seq_max_lens,
+        shuffle=False,
+        buffer_batches=0,
+        row_group_range=(n_train_rgs, total_rgs),
+        clip_vocab=clip_vocab,
+    )
+
+    if sidecar_config_path:
+        sidecar_cfg = _load_sidecar_config(sidecar_config_path)
+        sidecar_path = sidecar_cfg['path']
+        sidecar_key = sidecar_cfg.get('key', 'row_id')
+
+        user_int_specs = _normalize_sidecar_specs(
+            sidecar_cfg.get('user_int', []),
+            max((fid for fid, _, _ in train_dataset.user_int_schema.entries), default=0) + 1,
+        )
+        item_int_specs = _normalize_sidecar_specs(
+            sidecar_cfg.get('item_int', []),
+            max((fid for fid, _, _ in train_dataset.item_int_schema.entries), default=0) + 1,
+        )
+        user_dense_specs = _normalize_sidecar_specs(
+            sidecar_cfg.get('user_dense', []),
+            max((fid for fid, _, _ in train_dataset.user_dense_schema.entries), default=0) + 1,
+        )
+        item_dense_specs = _normalize_sidecar_specs(
+            sidecar_cfg.get('item_dense', []),
+            max((fid for fid, _, _ in train_dataset.item_dense_schema.entries), default=0) + 1,
+        )
+
+        sidecar_columns = [spec.name for spec in (
+            user_int_specs + item_int_specs + user_dense_specs + item_dense_specs
+        )]
+        store = SidecarFeatureStore(sidecar_path, sidecar_key, sidecar_columns)
+        if store.num_rows != train_dataset.num_rows + valid_dataset.num_rows:
+            raise ValueError(
+                f"Sidecar rows ({store.num_rows}) do not match dataset rows "
+                f"({train_dataset.num_rows + valid_dataset.num_rows})."
+            )
+
+        train_dataset = SidecarMergedDataset(
+            train_dataset,
+            store,
+            user_int_specs,
+            item_int_specs,
+            user_dense_specs,
+            item_dense_specs,
+        )
+        valid_dataset = SidecarMergedDataset(
+            valid_dataset,
+            store,
+            user_int_specs,
+            item_int_specs,
+            user_dense_specs,
+            item_dense_specs,
+        )
 
     use_cuda = torch.cuda.is_available()
     _train_kw = {}
@@ -740,17 +1178,6 @@ def get_pcvr_data(
     train_loader = DataLoader(
         train_dataset, batch_size=None,
         num_workers=num_workers, pin_memory=use_cuda, **_train_kw,
-    )
-
-    valid_dataset = PCVRParquetDataset(
-        parquet_path=data_dir,
-        schema_path=schema_path,
-        batch_size=batch_size,
-        seq_max_lens=seq_max_lens,
-        shuffle=False,
-        buffer_batches=0,
-        row_group_range=(n_train_rgs, total_rgs),
-        clip_vocab=clip_vocab,
     )
     valid_loader = DataLoader(
         valid_dataset, batch_size=None,
