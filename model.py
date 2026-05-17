@@ -1219,6 +1219,10 @@ class PCVRHyFormer(nn.Module):
         item_ns_groups: List[List[int]],
         engineered_dense_dim: int = 0,
         seq_engineered_dim: int = 0,
+        engineered_summary_mode: str = 'core',
+        engineered_summary_topk: int = 16,
+        engineered_summary_bottleneck_dim: int = 8,
+        engineered_summary_gate: bool = True,
         # Model hyperparameters
         d_model: int = 64,
         emb_dim: int = 64,
@@ -1258,6 +1262,10 @@ class PCVRHyFormer(nn.Module):
         self.ns_tokenizer_type = ns_tokenizer_type
         self.engineered_dense_dim = engineered_dense_dim
         self.seq_engineered_dim = seq_engineered_dim
+        self.engineered_summary_mode = engineered_summary_mode
+        self.engineered_summary_topk = engineered_summary_topk
+        self.engineered_summary_bottleneck_dim = engineered_summary_bottleneck_dim
+        self.engineered_summary_gate_enabled = engineered_summary_gate
 
         # ================== NS Tokens Construction ==================
 
@@ -1319,9 +1327,34 @@ class PCVRHyFormer(nn.Module):
 
         self.has_engineered_dense = engineered_dense_dim > 0
         if self.has_engineered_dense:
-            self.engineered_dense_proj = nn.Sequential(
-                nn.Linear(engineered_dense_dim, d_model),
+            self.engineered_summary_indices = self._build_engineered_summary_indices(
+                engineered_summary_mode=engineered_summary_mode,
+                engineered_summary_topk=engineered_summary_topk,
+            )
+            self.engineered_summary_input_dim = len(self.engineered_summary_indices)
+            if self.engineered_summary_input_dim <= 0:
+                self.engineered_summary_indices = list(range(engineered_dense_dim))
+                self.engineered_summary_input_dim = engineered_dense_dim
+            summary_hidden_dim = engineered_summary_bottleneck_dim if engineered_summary_bottleneck_dim > 0 else max(8, d_model // 4)
+            summary_hidden_dim = max(4, min(summary_hidden_dim, d_model))
+            self.register_buffer(
+                '_engineered_summary_index_tensor',
+                torch.tensor(self.engineered_summary_indices, dtype=torch.long),
+                persistent=False,
+            )
+            self.engineered_proj = nn.Sequential(
+                nn.Linear(self.engineered_summary_input_dim, summary_hidden_dim),
+                nn.LayerNorm(summary_hidden_dim),
+                nn.SiLU(),
+                nn.Dropout(dropout_rate),
+                nn.Linear(summary_hidden_dim, d_model),
                 nn.LayerNorm(d_model),
+            )
+            self.engineered_gate = (
+                nn.Sequential(
+                    nn.Linear(self.engineered_summary_input_dim, 1),
+                    nn.Sigmoid(),
+                ) if engineered_summary_gate else None
             )
 
         # Item dense feature projection (if available)
@@ -1341,7 +1374,8 @@ class PCVRHyFormer(nn.Module):
 
         # Total NS token count
         self.num_ns = (num_user_ns + (1 if self.has_user_dense else 0)
-                       + num_item_ns + (1 if self.has_item_dense else 0))
+                   + (1 if self.has_engineered_dense else 0)
+                   + num_item_ns + (1 if self.has_item_dense else 0))
 
         # ================== Check d_model % T == 0 constraint (full mode only) ==================
         T = num_queries * self.num_sequences + self.num_ns
@@ -1494,6 +1528,80 @@ class PCVRHyFormer(nn.Module):
         if self.num_time_buckets > 0:
             nn.init.xavier_normal_(self.time_embedding.weight.data)
             self.time_embedding.weight.data[0, :] = 0
+
+        if self.has_engineered_dense:
+            for module in self.engineered_proj.modules():
+                if isinstance(module, nn.Linear):
+                    nn.init.xavier_uniform_(module.weight, gain=0.5)
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)
+            if self.engineered_gate is not None:
+                gate_linear = self.engineered_gate[0]
+                if isinstance(gate_linear, nn.Linear):
+                    nn.init.xavier_uniform_(gate_linear.weight, gain=0.25)
+                    if gate_linear.bias is not None:
+                        nn.init.constant_(gate_linear.bias, -1.0)
+
+    def _build_engineered_summary_indices(
+        self,
+        engineered_summary_mode: str,
+        engineered_summary_topk: int,
+    ) -> List[int]:
+        """Select a compact subset of engineered_dense features for summary token input."""
+        if self.engineered_dense_dim <= 0:
+            return []
+
+        mode = engineered_summary_mode.lower().strip()
+        if mode == 'all':
+            return list(range(self.engineered_dense_dim))
+        if mode == 'topk':
+            k = max(1, int(engineered_summary_topk))
+            return list(range(min(k, self.engineered_dense_dim)))
+        if mode != 'core':
+            raise ValueError(
+                f"Unknown engineered_summary_mode={engineered_summary_mode}; "
+                "expected one of {'core', 'topk', 'all'}"
+            )
+
+        # Global summary: keep the most informative and least redundant fields.
+        indices = [5, 6, 7, 8, 9, 10, 12, 13]
+
+        # Per-domain compact summary: recent gap + burstiness for each sequence
+        # domain. This keeps recency / concentration signal while avoiding the
+        # full 13-dim per-domain block.
+        base_offset = 14
+        for domain_idx in range(self.num_sequences):
+            offset = base_offset + domain_idx * self.seq_engineered_dim
+            recent_gap_idx = offset + 2
+            burst_idx = offset + 7
+            if recent_gap_idx < self.engineered_dense_dim:
+                indices.append(recent_gap_idx)
+            if burst_idx < self.engineered_dense_dim:
+                indices.append(burst_idx)
+
+        return sorted(set(i for i in indices if 0 <= i < self.engineered_dense_dim))
+
+    def _make_engineered_summary_tok(
+        self,
+        engineered_dense_feats: Optional[torch.Tensor],
+        fallback_ref: torch.Tensor,
+    ) -> torch.Tensor:
+        """Build the lightweight summary token from selected engineered features."""
+        if engineered_dense_feats is None:
+            return fallback_ref.new_zeros((fallback_ref.shape[0], 1, self.d_model))
+
+        if hasattr(self, '_engineered_summary_index_tensor') and self._engineered_summary_index_tensor.numel() > 0:
+            selected = engineered_dense_feats.index_select(
+                dim=-1,
+                index=self._engineered_summary_index_tensor.to(engineered_dense_feats.device),
+            )
+        else:
+            selected = engineered_dense_feats
+
+        summary_tok = self.engineered_proj(selected)
+        if self.engineered_gate is not None:
+            summary_tok = summary_tok * self.engineered_gate(selected)
+        return summary_tok.unsqueeze(1)
 
     def reinit_high_cardinality_params(
         self, cardinality_threshold: int = 10000
@@ -1668,11 +1776,10 @@ class PCVRHyFormer(nn.Module):
         ns_parts = [user_ns]
         if self.has_user_dense:
             user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)  # (B, 1, D)
-            if self.has_engineered_dense and inputs.engineered_dense_feats is not None:
-                user_dense_tok = user_dense_tok + F.silu(
-                    self.engineered_dense_proj(inputs.engineered_dense_feats)
-                ).unsqueeze(1)
             ns_parts.append(user_dense_tok)
+        if self.has_engineered_dense:
+            summary_tok = self._make_engineered_summary_tok(inputs.engineered_dense_feats, user_ns)
+            ns_parts.append(summary_tok)
         ns_parts.append(item_ns)
         if self.has_item_dense:
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)  # (B, 1, D)
@@ -1719,11 +1826,10 @@ class PCVRHyFormer(nn.Module):
         ns_parts = [user_ns]
         if self.has_user_dense:
             user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)
-            if self.has_engineered_dense and inputs.engineered_dense_feats is not None:
-                user_dense_tok = user_dense_tok + F.silu(
-                    self.engineered_dense_proj(inputs.engineered_dense_feats)
-                ).unsqueeze(1)
             ns_parts.append(user_dense_tok)
+        if self.has_engineered_dense:
+            summary_tok = self._make_engineered_summary_tok(inputs.engineered_dense_feats, user_ns)
+            ns_parts.append(summary_tok)
         ns_parts.append(item_ns)
         if self.has_item_dense:
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)

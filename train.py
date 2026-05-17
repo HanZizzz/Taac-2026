@@ -169,6 +169,22 @@ def parse_args() -> argparse.Namespace:
                              'by a zero vector at forward time (0 = no skipping; '
                              'all features get an Embedding). Useful for saving GPU '
                              'memory on ultra-high-cardinality features.')
+    parser.add_argument('--engineered_dense_dim', type=int, default=0,
+                        help='Override engineered_dense feature dimension (0 = infer from dataset)')
+    parser.add_argument('--engineered_summary_mode', type=str, default='core',
+                        choices=['core', 'topk', 'all'],
+                        help='How to select engineered features for the summary token: '
+                             'core = compact hand-picked subset, '
+                             'topk = first K engineered features, '
+                             'all = full engineered vector')
+    parser.add_argument('--engineered_summary_topk', type=int, default=16,
+                        help='Feature count used when --engineered_summary_mode=topk')
+    parser.add_argument('--engineered_summary_bottleneck_dim', type=int, default=8,
+                        help='Bottleneck width inside the summary-token projection MLP')
+    parser.add_argument('--engineered_summary_gate', action='store_true', default=True,
+                        help='Enable scalar gating for the engineered summary token')
+    parser.add_argument('--no_engineered_summary_gate', dest='engineered_summary_gate', action='store_false',
+                        help='Disable scalar gating for the engineered summary token')
     parser.add_argument('--seq_id_threshold', type=int, default=10000,
                         help='Within the sequence tokenizer, features with vocab_size '
                              'exceeding this value are treated as id features and receive '
@@ -281,8 +297,16 @@ def main() -> None:
         "item_int_feature_specs": item_int_feature_specs,
         "user_dense_dim": pcvr_dataset.user_dense_schema.total_dim,
         "item_dense_dim": pcvr_dataset.item_dense_schema.total_dim,
-        "engineered_dense_dim": getattr(pcvr_dataset, 'engineered_dense_dim', 0),
+        "engineered_dense_dim": (
+            args.engineered_dense_dim
+            if args.engineered_dense_dim > 0
+            else getattr(pcvr_dataset, 'engineered_dense_dim', 0)
+        ),
         "seq_engineered_dim": getattr(pcvr_dataset, 'seq_engineered_dim', 0),
+        "engineered_summary_mode": args.engineered_summary_mode,
+        "engineered_summary_topk": args.engineered_summary_topk,
+        "engineered_summary_bottleneck_dim": args.engineered_summary_bottleneck_dim,
+        "engineered_summary_gate": args.engineered_summary_gate,
         "seq_vocab_sizes": pcvr_dataset.seq_domain_vocab_sizes,
         "user_ns_groups": user_ns_groups,
         "item_ns_groups": item_ns_groups,
